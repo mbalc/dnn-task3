@@ -5,94 +5,116 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import numpy as np
+
 from solution.data import load_datasets, INPUT_IMG_SIZE
 
-MODEL_DEST_PATH = os.path.join(os.getcwd(), 'model')
+torch.manual_seed(42)
+torch.backends.cudnn.deterministic = True
+np.random.seed(42)
+random.seed(42)
+
+## adjustables
+BASE_CHANNEL_COUNT = 40
+DEPTH = 3
+
+MODEL_DEST_FILENAME = 'model'
+MODEL_DEST_LOADFILENAME = 'model-epoch-0'
+MODEL_DEST_PATH = os.getcwd()
+## adjustables
+
+def model_path_with_suffix(suffix):
+    return os.path.join(MODEL_DEST_PATH, MODEL_DEST_FILENAME + suffix)
+
+
+RGB_CHANNEL_COUNT = 3
+CLASS_COUNT = 30
 
 EPSILON = 0.0000001
 
-def initCNN(class_names):
+def initFCN():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = CNN(INPUT_IMG_SIZE, len(class_names)).to(device)
+    net = FCN().to(device)
     return net, device
 
+def saveMyModel(net, suffix):
+    path = model_path_with_suffix(suffix)
+    print('Saving the model serialization to', path)
 
-def saveMyModel(net):
-    print('Saving the model serialization to', MODEL_DEST_PATH)
+    torch.save(net.state_dict(), path)
 
-    torch.save(net.state_dict(), MODEL_DEST_PATH)
-
-def loadMyModel(class_names):
-    model, device = initCNN(class_names)
-    model.load_state_dict(torch.load(MODEL_DEST_PATH))
+def loadMyModel():
+    model, device = initFCN()
+    model.load_state_dict(torch.load(os.path.join(MODEL_DEST_PATH, MODEL_DEST_LOADFILENAME)))
     model.eval()
     return model, device
 
+class FCN(nn.Module):
+    def __init__(self):
+        super(FCN, self).__init__()
 
-class BatchNorm(nn.Module):
-    def __init__(self, channels):
-        super(BatchNorm, self).__init__()
-        self.weights = nn.Parameter(torch.zeros(channels).uniform_())
-        self.biases = nn.Parameter(torch.zeros(channels, dtype=torch.float32))
-
-    def forward(self, data):
-        imgs = data
-        weights = self.weights.view(-1)
-        biases = self.biases.view(-1)
-
-        def expanded(tens):
-            tens = tens.unsqueeze(0) # clone for each batch member
-            tens = tens.unsqueeze(-1) # clone for each pixel in row
-            tens = tens.unsqueeze(-1) # clone for each pixel in column
-            return tens.expand(imgs.shape)
-
-        means = torch.mean(imgs, [0, 2, 3])
-        diff = imgs - expanded(means)
-        var2 = torch.sum(diff * diff, [0, 2, 3]) / (diff.numel() / len(diff))
-
-        normal = diff / expanded(torch.sqrt(var2 + EPSILON))
-        return ((normal * expanded(weights)) + expanded(biases)).view(data.shape)
-
-class CNN(nn.Module):
-    def __init__(self, imgSize, classCount):
-        super(CNN, self).__init__()        
-
-        # shape: (in_chann, out_chann, kernel_size, stride, padding, pooling)
-        # IMPORTANT = in_chann for n+1th elem must equal out_chann of nth one
-        CONV_DESCS = [
-            (3, 18, 3, 1, 1, 2),
-            (18, 30, 3, 1, 1, 2),
-            (30, 50, 3, 1, 1, 2),
-            (50, 80, 3, 1, 1, 2)
-        ]
-
-        HIDDEN_FC_SIZES = [6000]
-
-        def imgSizeAfterConvAndPool(imgSize, kernel_size, padding, stride, pooling):
-            return int((int((imgSize - kernel_size + 2*(padding)) / stride) + 1) / pooling)
+        CHANNELS = [None]
+        CHANNELS.extend([BASE_CHANNEL_COUNT * (2 ** n) for n in range(DEPTH)])
+        KERNEL_SIZE = 3
+        PADDING = (KERNEL_SIZE - 1) // 2
         
-        self.convs = nn.ModuleList([])
-        for in_chann, out_chann, kernel_size, padding, stride, pooling in CONV_DESCS:
-            self.convs.append(nn.Sequential(
-                nn.Conv2d(in_chann, out_chann, kernel_size=kernel_size, stride=stride, padding=padding),
+        leftconvs = []
+        maxpools = []
+        upscalers = []
+        rightconvs = []
+        for in_chann, out_chann in zip(CHANNELS[:-1], CHANNELS[1:]):
+            if (in_chann) == None: in_chann = RGB_CHANNEL_COUNT
+            leftconvs.append(nn.Sequential(
+                nn.Conv2d(in_chann, out_chann, KERNEL_SIZE, padding=PADDING),
                 nn.ReLU(),
-                BatchNorm(out_chann),
-                nn.MaxPool2d(kernel_size=pooling, stride=pooling)
+                nn.Conv2d(out_chann, out_chann, KERNEL_SIZE, padding=PADDING),
+                nn.ReLU(),
             ))
-            imgSize = imgSizeAfterConvAndPool(imgSize, kernel_size, padding, stride, pooling)
-            self.convOutputSize = imgSize * imgSize * out_chann
 
-        hiddenFcs = [self.convOutputSize] + HIDDEN_FC_SIZES + [classCount]
+            maxpools.append(nn.MaxPool2d(2, stride = 2)) # 4 pixels -> 1 pixel
 
-        self.fcs = nn.ModuleList([nn.Linear(s1, s2) for s1, s2 in zip(hiddenFcs[:-1], hiddenFcs[1:])])
+            upscalers.append(nn.ConvTranspose2d(2 * out_chann, out_chann, KERNEL_SIZE + 1, padding=PADDING, stride=2)) # TODO validate if this makes sense, parameterize
+
+            if (in_chann) == RGB_CHANNEL_COUNT: in_chann = CLASS_COUNT
+            else: in_chann = out_chann # we want the very last conv to give CLASS_COUNT channels, otherwise same as out_chann
+            rightconvs.append(nn.Sequential(
+                nn.Conv2d(2 * out_chann, out_chann, KERNEL_SIZE, padding=PADDING), # channels from left part of U-net + from previous layer
+                nn.ReLU(),
+                nn.Conv2d(out_chann, in_chann, KERNEL_SIZE, padding=PADDING),
+                nn.ReLU(),
+            ))
+
+        intermed_chann_count = CHANNELS[-1]
+
+        self.leftconvs = nn.ModuleList(leftconvs)
+        self.maxpools = nn.ModuleList(maxpools)
+
+        self.intermediate = nn.Sequential(
+            nn.Conv2d(intermed_chann_count, 2 * intermed_chann_count, KERNEL_SIZE, padding=PADDING),
+            nn.ReLU(),
+            nn.Conv2d(2 * intermed_chann_count, 2 * intermed_chann_count, KERNEL_SIZE, padding=PADDING),
+            nn.ReLU(),
+        )
+
+        upscalers.reverse()
+        self.upscalers = nn.ModuleList(upscalers)
+        rightconvs.reverse()
+        self.rightconvs = nn.ModuleList(rightconvs)
     
-    def forward(self, out):
-        for conv in self.convs:
-            out = conv(out)
-        
-        out = out.view(-1, self.convOutputSize)
-        
-        for fc in self.fcs[:-1]:
-            out = F.relu(fc(out))
+    def forward(self, imgs): # imgs.shape = (BATCH_SIZE, CHANNEL_COUNT, HEIGHT, WIDTH)
+        output_buffer = [] # storage for data to crop up and provide to the right side of unet
 
-        return self.fcs[-1](out)
+        for (conv, pool) in zip(self.leftconvs, self.maxpools):
+            imgs = conv(imgs)
+            output_buffer.append(imgs)
+            imgs = pool(imgs)
+
+        imgs = self.intermediate(imgs)
+
+        for (upscale, conv) in zip(self.upscalers, self.rightconvs):
+            imgs = upscale(imgs)
+            pre_downscale = output_buffer.pop() # TODO potential cropping
+            imgs = torch.cat([imgs, pre_downscale], dim=1) # merge channel-wise
+            imgs = conv(imgs)
+
+        return imgs
